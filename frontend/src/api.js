@@ -8,6 +8,36 @@ const TENANT_ID  = import.meta.env.VITE_AZURE_TENANT_ID
 const BACKEND    = import.meta.env.VITE_BACKEND_URL ? `${import.meta.env.VITE_BACKEND_URL}/api` : '/api'
 const TZ         = 'America/Sao_Paulo'
 
+// ─── Helpers de fuso ──────────────────────────────────────────────────────────
+
+/**
+ * Formata um Date como "YYYY-MM-DDTHH:MM:SS" no fuso de Brasília,
+ * SEM converter para UTC. É o formato que o Graph API espera junto com timeZone.
+ */
+function toBrasiliaISO(date) {
+  return new Date(date).toLocaleString('sv-SE', { timeZone: TZ }).replace(' ', 'T')
+}
+
+/**
+ * Retorna a data local de Brasília como "YYYY-MM-DD"
+ * (evita virar dia anterior ao converter para UTC)
+ */
+function toBrasiliaDateStr(date) {
+  return toBrasiliaISO(date).slice(0, 10)
+}
+
+/**
+ * "Agora" no horário de Brasília como objeto Date corrigido.
+ * Usado para comparações no slot finder.
+ */
+function nowBrasilia() {
+  const now = new Date()
+  // Offset em minutos de Brasília em relação ao UTC (-180 = UTC-3)
+  const offset = -180
+  const utc = now.getTime() + now.getTimezoneOffset() * 60000
+  return new Date(utc + offset * 60000)
+}
+
 // ─── MSAL ─────────────────────────────────────────────────────────────────────
 
 const msal = new PublicClientApplication({
@@ -82,8 +112,9 @@ export async function getFreeBusy(emails, daysAhead = 14) {
     method: 'POST',
     body: JSON.stringify({
       schedules: emails,
-      startTime: { dateTime: now.toISOString().slice(0, 19), timeZone: TZ },
-      endTime:   { dateTime: end.toISOString().slice(0, 19), timeZone: TZ },
+      // Usar toBrasiliaISO garante que o datetime enviado é Brasília, não UTC
+      startTime: { dateTime: toBrasiliaISO(now), timeZone: TZ },
+      endTime:   { dateTime: toBrasiliaISO(end), timeZone: TZ },
       availabilityViewInterval: 30,
     }),
   })
@@ -95,8 +126,9 @@ export async function createGraphEvent(subject, start, end, attendeeEmails, isOn
     method: 'POST',
     body: JSON.stringify({
       subject,
-      start: { dateTime: start.toISOString().slice(0, 19), timeZone: TZ },
-      end:   { dateTime: end.toISOString().slice(0, 19),   timeZone: TZ },
+      // toBrasiliaISO garante que o evento é criado no horário certo
+      start: { dateTime: toBrasiliaISO(start), timeZone: TZ },
+      end:   { dateTime: toBrasiliaISO(end),   timeZone: TZ },
       attendees: attendeeEmails.map(email => ({
         emailAddress: { address: email }, type: 'required',
       })),
@@ -112,17 +144,19 @@ export function findSlots(schedules, window, durationMin, max = 3) {
   const { daysAhead = 14, morningStart = '09:00', morningEnd = '12:00',
           afternoonStart = '13:00', afternoonEnd = '18:00' } = window
   const slots = []
-  const now   = new Date()
+  const now   = nowBrasilia() // "agora" no horário de Brasília
 
   for (let d = 0; d < daysAhead; d++) {
     const date = new Date(now)
     date.setDate(now.getDate() + d)
     if ([0, 6].includes(date.getDay())) continue
 
-    const ds = date.toISOString().split('T')[0]
+    // Data no fuso de Brasília — evita virar dia anterior em UTC
+    const ds = toBrasiliaDateStr(date)
 
     for (const [ws, we] of [[morningStart, morningEnd], [afternoonStart, afternoonEnd]]) {
-      let cursor = new Date(`${ds}T${ws}:00`)
+      // Criar os cursores já no horário de Brasília
+      let cursor  = new Date(`${ds}T${ws}:00`)
       const winEnd = new Date(`${ds}T${we}:00`)
 
       while (cursor.getTime() + durationMin * 60000 <= winEnd.getTime()) {
@@ -131,9 +165,13 @@ export function findSlots(schedules, window, durationMin, max = 3) {
           const free = schedules.every(s =>
             !s.scheduleItems?.some(item => {
               if (!['busy', 'oof'].includes(item.status)) return false
-              const bs = new Date(item.start.dateTime)
-              const be = new Date(item.end.dateTime)
-              return bs < slotEnd && be > cursor
+              // O Graph retorna os horários dos items em UTC — converter para comparar
+              const bs = new Date(item.start.dateTime + (item.start.dateTime.endsWith('Z') ? '' : 'Z'))
+              const be = new Date(item.end.dateTime   + (item.end.dateTime.endsWith('Z')   ? '' : 'Z'))
+              // cursor e slotEnd estão no horário local do browser — converter para UTC para comparar
+              const cursorUTC  = new Date(cursor.getTime()  + (now.getTimezoneOffset() * 60000 * -1) - (180 * 60000 * -1))
+              const slotEndUTC = new Date(slotEnd.getTime() + (now.getTimezoneOffset() * 60000 * -1) - (180 * 60000 * -1))
+              return bs < slotEndUTC && be > cursorUTC
             })
           )
           if (free) {

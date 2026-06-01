@@ -78,7 +78,7 @@ export async function getFreeBusy(emails, daysAhead = 14) {
   const end = new Date(now)
   end.setDate(now.getDate() + daysAhead)
 
-  const result = await graph('/calendar/getSchedule', {
+  const result = await graph('/me/calendar/getSchedule', {
     method: 'POST',
     body: JSON.stringify({
       schedules: emails,
